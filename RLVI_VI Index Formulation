@@ -1,0 +1,298 @@
+"""
+RL-VI: Reinforcement Learning-Based Dynamic Vegetation Index Formulation
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
+
+# -----------------------------
+# 1. CONFIGURATION
+# -----------------------------
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+N_BANDS = 8  # e.g. B2, B3, B4, B5, B6, B8, B11, B12
+N_ACTIONS = 3 * N_BANDS  # each band: increase, decrease, or keep
+MAX_EPISODES = 100       # increase for full training
+MAX_STEPS = 30           # steps per episode
+GAMMA = 0.99
+LR = 1e-3
+EPSILON_START = 1.0
+EPSILON_END = 0.1
+EPSILON_DECAY = 0.995
+
+
+# -----------------------------
+# 2. DATA LOADING (ADAPT THIS)
+# -----------------------------
+
+def load_dummy_data():
+    """
+    TODO: Replace this with real Sentinel-2 + label loading.
+
+    Expected:
+    X: shape (N_samples, N_BANDS)
+    y: shape (N_samples,) with class labels [0..C-1]
+    """
+    np.random.seed(42)
+    N = 1000
+    X = np.random.rand(N, N_BANDS).astype(np.float32)
+    y = np.random.randint(0, 4, size=(N,))  # e.g. 4 stress classes
+    return X, y
+
+
+# -----------------------------
+# 3. RL ENVIRONMENT
+# -----------------------------
+
+class RLVIVegIndexEnv:
+    """
+    RL environment for learning vegetation index weights.
+    State: current weight vector w (size N_BANDS)
+    Action: for each band, choose -1 (decrease), 0 (same), or +1 (increase)
+    Reward: macro F1-score of classifier using this VI.
+    """
+
+    def __init__(self, X_train, y_train, X_val, y_val,
+                 step_size=0.1, w_init=None):
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_val = X_val
+        self.y_val = y_val
+        self.step_size = step_size
+
+        if w_init is None:
+            # start with equal weights
+            self.w = np.ones(N_BANDS, dtype=np.float32) / N_BANDS
+        else:
+            self.w = w_init.astype(np.float32)
+
+        self.classifier = RandomForestClassifier(
+            n_estimators=100, random_state=42
+        )
+
+    def reset(self):
+        self.w = np.ones(N_BANDS, dtype=np.float32) / N_BANDS
+        return self._get_state()
+
+    def _get_state(self):
+        # state is current weight vector
+        return self.w.copy()
+
+    def _compute_vi(self, X):
+        """
+        Generic linear VI:
+            VI = X @ w  (dot product of bands with weights)
+        You can replace this with a nonlinear VI if desired.
+        """
+        return (X * self.w).sum(axis=1, keepdims=True)
+
+    def _evaluate_weights(self):
+        """
+        Train a simple classifier on the VI and compute macro F1-score
+        on validation set.
+        """
+        VI_train = self._compute_vi(self.X_train)
+        VI_val = self._compute_vi(self.X_val)
+
+        self.classifier.fit(VI_train, self.y_train)
+        y_pred = self.classifier.predict(VI_val)
+        f1 = f1_score(self.y_val, y_pred, average='macro')
+        return f1
+
+    def step(self, action_idx):
+        """
+        action_idx is an integer in [0, N_ACTIONS).
+        We map it to (band, action_type) where action_type:
+            0: decrease weight
+            1: keep weight
+            2: increase weight
+        """
+
+        band = action_idx // 3
+        action_type = action_idx % 3
+
+        if action_type == 0:
+            self.w[band] -= self.step_size
+        elif action_type == 2:
+            self.w[band] += self.step_size
+
+        # clamp weights
+        self.w = np.clip(self.w, 0.0, 1.0)
+        # normalize to sum to 1 to keep interpretation as contributions
+        if self.w.sum() > 0:
+            self.w = self.w / self.w.sum()
+
+        # compute reward
+        f1 = self._evaluate_weights()
+        reward = float(f1)  # already between 0 and 1
+
+        # in this simple setup, episode termination is handled externally
+        done = False
+        next_state = self._get_state()
+
+        return next_state, reward, done, {}
+
+
+# -----------------------------
+# 4. DQN AGENT
+# -----------------------------
+
+class DQN(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
+        super(DQN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ReplayBuffer:
+    def __init__(self, capacity=10000):
+        self.capacity = capacity
+        self.buffer = []
+        self.position = 0
+
+    def push(self, s, a, r, s_next, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.position] = (s, a, r, s_next, done)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        idx = np.random.choice(len(self.buffer), batch_size, replace=False)
+        s, a, r, s_next, done = zip(*[self.buffer[i] for i in idx])
+        return (np.array(s, dtype=np.float32),
+                np.array(a, dtype=np.int64),
+                np.array(r, dtype=np.float32),
+                np.array(s_next, dtype=np.float32),
+                np.array(done, dtype=np.float32))
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# -----------------------------
+# 5. TRAINING LOOP
+# -----------------------------
+
+def train_rl_vi():
+    # 1) Load data
+    X, y = load_dummy_data()
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.4, random_state=42, stratify=y
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
+    )
+
+    # 2) Initialize environment & agent
+    env = RLVIVegIndexEnv(X_train, y_train, X_val, y_val)
+
+    state_dim = N_BANDS
+    action_dim = N_ACTIONS
+
+    q_net = DQN(state_dim, action_dim).to(DEVICE)
+    target_net = DQN(state_dim, action_dim).to(DEVICE)
+    target_net.load_state_dict(q_net.state_dict())
+
+    optimizer = optim.Adam(q_net.parameters(), lr=LR)
+    replay_buffer = ReplayBuffer(capacity=5000)
+
+    epsilon = EPSILON_START
+    batch_size = 64
+    target_update_freq = 10
+
+    best_f1 = 0.0
+    best_w = env.w.copy()
+
+    for episode in range(1, MAX_EPISODES + 1):
+        state = env.reset()
+        episode_reward = 0.0
+
+        for t in range(MAX_STEPS):
+            # epsilon-greedy policy
+            if np.random.rand() < epsilon:
+                action = np.random.randint(0, action_dim)
+            else:
+                with torch.no_grad():
+                    s_tensor = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+                    q_values = q_net(s_tensor)
+                    action = int(q_values.argmax().item())
+
+            next_state, reward, done, _ = env.step(action)
+            episode_reward += reward
+
+            replay_buffer.push(state, action, reward, next_state, done)
+            state = next_state
+
+            if len(replay_buffer) >= batch_size:
+                # Sample batch
+                s_b, a_b, r_b, s_next_b, done_b = replay_buffer.sample(batch_size)
+
+                s_b = torch.tensor(s_b, device=DEVICE)
+                a_b = torch.tensor(a_b, device=DEVICE)
+                r_b = torch.tensor(r_b, device=DEVICE)
+                s_next_b = torch.tensor(s_next_b, device=DEVICE)
+                done_b = torch.tensor(done_b, device=DEVICE)
+
+                # Q-learning target
+                q_values = q_net(s_b).gather(1, a_b.unsqueeze(1)).squeeze(1)
+                with torch.no_grad():
+                    next_q_values = target_net(s_next_b).max(1)[0]
+                    target_q = r_b + GAMMA * next_q_values * (1 - done_b)
+
+                loss = nn.MSELoss()(q_values, target_q)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            if done:
+                break
+
+        # Decay epsilon
+        epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
+
+        # Soft update of target network
+        if episode % target_update_freq == 0:
+            target_net.load_state_dict(q_net.state_dict())
+
+        # Track best weights by validation F1
+        current_f1 = env._evaluate_weights()
+        if current_f1 > best_f1:
+            best_f1 = current_f1
+            best_w = env.w.copy()
+
+        print(f"Episode {episode:03d} | Reward: {episode_reward:.3f} | "
+              f"Val F1: {current_f1:.3f} | Best F1: {best_f1:.3f}")
+
+    print("\nTraining complete.")
+    print("Best learned weights (RL-VI):", best_w)
+    print("Best validation F1:", best_f1)
+
+    # Final evaluation on test set
+    env.w = best_w
+    VI_test = env._compute_vi(X_test)
+    final_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    final_clf.fit(env._compute_vi(X_train), y_train)
+    y_pred_test = final_clf.predict(VI_test)
+    f1_test = f1_score(y_test, y_pred_test, average='macro')
+
+    print("Test F1 with RL-VI:", f1_test)
+
+
+if __name__ == "__main__":
+    train_rl_vi()
